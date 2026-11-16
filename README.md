@@ -28,7 +28,13 @@ when the window changes size. `matrix` fixes both:
 ## Install
 
 ```sh
-go install .          # or: make install
+go install github.com/soda92/matrix@latest
+```
+
+Or from a clone:
+
+```sh
+make install            # or: go install .
 make build            # ./matrix
 ```
 

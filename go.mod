@@ -1,4 +1,4 @@
-module matrix
+module github.com/soda92/matrix
 
 go 1.27.4
 
