@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -16,12 +17,13 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.2.0"
-
 const (
 	enterScreen = "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?7l"
 	leaveScreen = "\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l"
 )
+
+// version is overridden at build time with -ldflags "-X main.version=...".
+var version = "dev"
 
 var (
 	errQuit    = errors.New("quit")
@@ -55,9 +57,13 @@ var schemeOrder = []string{
 }
 
 type options struct {
-	cfg  config
-	name string
-	lang string
+	cfg    config
+	name   string
+	lang   string
+	seed   int64
+	frames int
+	width  int
+	height int
 }
 
 type app struct {
@@ -71,59 +77,80 @@ type app struct {
 	term     *termState
 
 	hue           float64
+	frames        int
 	paused        bool
 	closed        bool
+	screenActive  bool
 	lastSizeCheck time.Time
+
+	escAt      time.Time
+	escPending bool
+	inSeq      bool
 }
 
 func main() {
+	os.Exit(realMain())
+}
+
+func realMain() int {
 	opt, err := parseFlags(os.Args[1:])
 	switch {
 	case err == nil:
 	case errors.Is(err, flag.ErrHelp):
 		fmt.Print(usageText)
-		return
+		return 0
 	case errors.Is(err, errVersion):
-		return
+		return 0
 	default:
 		fmt.Fprintln(os.Stderr, "matrix:", err)
-		os.Exit(2)
+		return 2
 	}
 
-	a, err := newApp(opt)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "matrix:", err)
-		os.Exit(1)
-	}
+	a := newApp(opt)
+	defer a.shutdown()
 	if err := a.run(); err != nil && !errors.Is(err, errQuit) {
 		fmt.Fprintln(os.Stderr, "matrix:", err)
-		a.shutdown()
-		os.Exit(1)
+		return 1
 	}
-	a.shutdown()
+	return 0
 }
 
-func newApp(opt options) (*app, error) {
-	t, err := setupTerminal()
-	if err != nil {
-		return nil, err
-	}
+func newApp(opt options) *app {
 	w, h := termSize()
+	if opt.width > 0 && opt.height > 0 {
+		w, h = opt.width, opt.height
+	}
+	seed := opt.seed
+	if seed < 0 {
+		seed = time.Now().UnixNano()
+	}
 	return &app{
 		cfg:      opt.cfg,
 		name:     opt.name,
 		langName: opt.lang,
-		m:        newMatrix(opt.cfg, w, h, time.Now().UnixNano()),
+		m:        newMatrix(opt.cfg, w, h, seed),
 		pal:      newPalette(opt.cfg.truecolor),
 		frame:    newFrameBuf(w, h),
 		out:      bufio.NewWriterSize(os.Stdout, 1<<18),
-		term:     t,
+		term:     &termState{fd: int(os.Stdin.Fd())},
 		hue:      opt.cfg.hue,
-	}, nil
+		frames:   opt.frames,
+	}
 }
 
 func (a *app) run() error {
+	if a.frames > 0 {
+		return a.runFrames()
+	}
+
+	t, err := setupTerminal()
+	if err != nil {
+		return err
+	}
+	a.term = t
+
 	a.out.WriteString(enterScreen)
+	a.screenActive = true
 	if err := a.out.Flush(); err != nil {
 		return err
 	}
@@ -132,7 +159,7 @@ func (a *app) run() error {
 	go readKeys(keys)
 
 	sigs := make(chan os.Signal, 4)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer signal.Stop(sigs)
 
 	ticker := time.NewTicker(time.Second / time.Duration(a.cfg.fps))
@@ -147,6 +174,9 @@ func (a *app) run() error {
 			last = now
 			if dt > 0.25 {
 				dt = 0.25
+			}
+			if a.escTimedOut(now) {
+				return errQuit
 			}
 			if !a.paused {
 				a.m.update(dt)
@@ -164,6 +194,22 @@ func (a *app) run() error {
 			return errQuit
 		}
 	}
+}
+
+// runFrames renders a fixed number of frames to stdout without touching the
+// terminal. Together with --seed and --size it gives reproducible output for
+// screenshots, GIFs, and golden tests.
+func (a *app) runFrames() error {
+	dt := 1 / float64(a.cfg.fps)
+	for i := 0; i < a.frames; i++ {
+		a.m.update(dt)
+		a.hue += dt * a.cfg.hueSpeed
+		a.pal.update(a.hue, a.cfg.sat)
+		if _, err := a.out.Write(a.frame.draw(a.m, a.pal, a.cfg.bold)); err != nil {
+			return writeErr(err)
+		}
+	}
+	return a.out.Flush()
 }
 
 func (a *app) render() error {
@@ -194,10 +240,37 @@ func (a *app) checkResize(now time.Time) {
 	a.out.WriteString("\x1b[2J")
 }
 
+// escTimedOut reports whether a lone escape byte has waited long enough to be
+// treated as the Escape key rather than the start of a sequence.
+func (a *app) escTimedOut(now time.Time) bool {
+	return a.escPending && now.Sub(a.escAt) > 120*time.Millisecond
+}
+
 func (a *app) handleKey(b byte) bool {
-	switch b {
-	case 'q', 'Q', 0x1b, 0x03:
+	if a.inSeq {
+		// Swallow the rest of a CSI/SS3 sequence, for example arrow keys.
+		if b >= 0x40 && b <= 0x7e {
+			a.inSeq = false
+		}
+		return false
+	}
+	if a.escPending {
+		a.escPending = false
+		if b == '[' || b == 'O' {
+			a.inSeq = true
+			return false
+		}
+		// ESC followed by an ordinary key is treated as Alt+key: quit.
 		return true
+	}
+
+	switch b {
+	case 'q', 'Q', 0x03:
+		return true
+	case 0x1b:
+		a.escPending = true
+		a.escAt = time.Now()
+		return false
 	case 'p', 'P', ' ':
 		a.paused = !a.paused
 	case '+', '=':
@@ -274,8 +347,10 @@ func (a *app) shutdown() {
 		return
 	}
 	a.closed = true
-	a.out.WriteString(leaveScreen)
-	a.out.Flush()
+	if a.screenActive {
+		a.out.WriteString(leaveScreen)
+		a.out.Flush()
+	}
 	a.term.restore()
 }
 
@@ -357,6 +432,9 @@ func parseFlags(args []string) (options, error) {
 		truecolor  = detectTruecolor()
 		hueDeg     = -1.0
 		hueSpeed   = -1.0
+		seed       = int64(-1)
+		frames     = 0
+		size       = ""
 		showVer    bool
 	)
 
@@ -382,6 +460,9 @@ func parseFlags(args []string) (options, error) {
 	fs.BoolVar(&opt.cfg.bold, "bold", false, "bold glyphs")
 	fs.Float64Var(&hueDeg, "hue", -1, "override base hue in degrees")
 	fs.Float64Var(&hueSpeed, "hue-speed", -1, "hue rotation in turns per second")
+	fs.Int64Var(&seed, "seed", -1, "random seed for reproducible runs")
+	fs.IntVar(&frames, "frames", 0, "render N frames to stdout and exit")
+	fs.StringVar(&size, "size", "", "force WxH dimensions for --frames")
 	fs.BoolVar(&showVer, "v", false, "print version")
 	fs.BoolVar(&showVer, "version", false, "print version")
 
@@ -407,9 +488,6 @@ func parseFlags(args []string) (options, error) {
 	if hueDeg >= 0 {
 		opt.cfg.hue = hueDeg / 360
 	}
-	if hueSpeed >= 0 {
-		opt.cfg.hueSpeed = hueSpeed
-	}
 	opt.cfg.speed = math.Max(0.1, math.Min(10, float64(speedPct)/100))
 	opt.cfg.density = math.Max(0.05, math.Min(3, float64(densityPct)/100))
 	opt.cfg.fps = fps
@@ -420,16 +498,32 @@ func parseFlags(args []string) (options, error) {
 		opt.cfg.fps = 240
 	}
 	opt.cfg.truecolor = truecolor
+	opt.seed = seed
+	opt.frames = frames
+	if opt.frames < 0 {
+		opt.frames = 0
+	}
+	if size != "" {
+		w, h, err := parseSize(size)
+		if err != nil {
+			return opt, err
+		}
+		opt.width, opt.height = w, h
+	}
+
+	seen := make(map[string]bool, 4)
+	fs.Visit(func(f *flag.Flag) { seen[f.Name] = true })
+	if seen["hue-speed"] {
+		opt.cfg.hueSpeed = hueSpeed
+	}
+	if opt.frames > 0 && !seen["T"] && !seen["truecolor"] {
+		// Captures should look identical everywhere.
+		opt.cfg.truecolor = true
+	}
 
 	// -C/--chars wins over -L/--lang, and its cell width is inferred from
 	// the glyphs so CJK text lines up without an extra flag.
-	custom := make(map[string]bool, 2)
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "C" || f.Name == "chars" {
-			custom[f.Name] = true
-		}
-	})
-	if custom["C"] || custom["chars"] {
+	if seen["C"] || seen["chars"] {
 		opt.lang = "custom"
 		opt.cfg.chars = splitRunes(chars)
 		if len(opt.cfg.chars) == 0 {
@@ -447,6 +541,27 @@ func parseFlags(args []string) (options, error) {
 	opt.cfg.chars = def.chars
 	opt.cfg.wide = def.wide
 	return opt, nil
+}
+
+func parseSize(s string) (int, int, error) {
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		return r == 'x' || r == 'X' || r == '×'
+	})
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid size %q (want WxH, e.g. 100x30)", s)
+	}
+	w, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid size %q: %w", s, err)
+	}
+	h, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid size %q: %w", s, err)
+	}
+	if w < 1 || h < 1 || w > 10000 || h > 10000 {
+		return 0, 0, fmt.Errorf("size %q out of range", s)
+	}
+	return w, h, nil
 }
 
 const usageText = `matrix - falling glyph rain for your terminal
@@ -467,6 +582,9 @@ Options:
       --hue-speed T   hue rotation in turns per second (default 0)
   -T, --truecolor     force 24-bit color (auto-detected by default)
   -b, --bold          render glyphs in bold
+      --seed N        seed the simulation for reproducible output
+      --frames N      render N frames to stdout and exit (no TUI)
+      --size WxH      force dimensions, e.g. 100x30 (with --frames)
   -v, --version       print version and exit
 
 Keys:

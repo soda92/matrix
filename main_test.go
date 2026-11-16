@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseFlagsLang(t *testing.T) {
@@ -81,5 +85,125 @@ func TestParseFlagsBasics(t *testing.T) {
 	}
 	if _, err := parseFlags([]string{"extra"}); err == nil {
 		t.Error("positional argument should fail")
+	}
+}
+
+func TestParseFlagsCapture(t *testing.T) {
+	opt, err := parseFlags([]string{"--seed", "42", "--frames", "10", "--size", "100x30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opt.seed != 42 {
+		t.Errorf("seed = %d, want 42", opt.seed)
+	}
+	if opt.frames != 10 {
+		t.Errorf("frames = %d, want 10", opt.frames)
+	}
+	if opt.width != 100 || opt.height != 30 {
+		t.Errorf("size = %dx%d, want 100x30", opt.width, opt.height)
+	}
+	if !opt.cfg.truecolor {
+		t.Error("capture mode should force truecolor")
+	}
+
+	if _, err := parseFlags([]string{"--size", "100"}); err == nil {
+		t.Error("incomplete size should fail")
+	}
+	if _, err := parseFlags([]string{"--size", "0x30"}); err == nil {
+		t.Error("zero width should fail")
+	}
+}
+
+func TestParseSize(t *testing.T) {
+	for _, in := range []string{"100x30", "100X30", "100×30"} {
+		w, h, err := parseSize(in)
+		if err != nil || w != 100 || h != 30 {
+			t.Errorf("parseSize(%q) = %d,%d,%v", in, w, h, err)
+		}
+	}
+	for _, in := range []string{"", "100", "x30", "100x", "a x b", "100x0"} {
+		if _, _, err := parseSize(in); err == nil {
+			t.Errorf("parseSize(%q) should fail", in)
+		}
+	}
+}
+
+func TestHueSpeedAcceptsZeroAndNegative(t *testing.T) {
+	opt, err := parseFlags([]string{"-c", "green", "--hue-speed", "0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opt.cfg.hueSpeed != 0 {
+		t.Errorf("hue speed = %v, want 0", opt.cfg.hueSpeed)
+	}
+	opt, err = parseFlags([]string{"-c", "rainbow", "--hue-speed", "-0.25"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opt.cfg.hueSpeed != -0.25 {
+		t.Errorf("hue speed = %v, want -0.25", opt.cfg.hueSpeed)
+	}
+}
+
+func TestEscapeSequencesDoNotQuit(t *testing.T) {
+	a := newApp(options{cfg: testConfig(), name: "green", lang: "classic", seed: 1})
+	for _, b := range []byte{0x1b, '['} {
+		if a.handleKey(b) {
+			t.Fatal("escape sequence start should not quit")
+		}
+	}
+	for _, b := range []byte{'A'} {
+		if a.handleKey(b) {
+			t.Fatal("arrow key should not quit")
+		}
+	}
+	if a.inSeq || a.escPending {
+		t.Fatal("sequence state was not cleared")
+	}
+
+	// A lone escape quits after the timeout.
+	if a.handleKey(0x1b) {
+		t.Fatal("escape should wait for a possible sequence")
+	}
+	if !a.escPending {
+		t.Fatal("escape was not recorded")
+	}
+	if a.escTimedOut(time.Now()) {
+		t.Fatal("escape timed out immediately")
+	}
+	if !a.escTimedOut(time.Now().Add(200 * time.Millisecond)) {
+		t.Fatal("escape should time out")
+	}
+	if !a.handleKey('q') {
+		t.Fatal("q should quit")
+	}
+}
+
+func TestHeadlessFramesAreDeterministic(t *testing.T) {
+	opt := options{
+		cfg:    testConfig(),
+		name:   "green",
+		lang:   "classic",
+		seed:   1234,
+		frames: 6,
+		width:  40,
+		height: 12,
+	}
+	render := func() string {
+		a := newApp(opt)
+		var buf bytes.Buffer
+		a.out = bufio.NewWriter(&buf)
+		if err := a.runFrames(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+	first := render()
+	second := render()
+	if first != second {
+		t.Fatal("same seed produced different frames")
+	}
+	if got := strings.Count(first, "\x1b[?2026h"); got != opt.frames {
+		t.Errorf("frame count = %d, want %d", got, opt.frames)
 	}
 }

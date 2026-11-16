@@ -1,6 +1,6 @@
 module github.com/soda92/matrix
 
-go 1.27.4
+go 1.26.0
 
 require golang.org/x/term v0.48.0
 
