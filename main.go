@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -470,7 +471,7 @@ func parseFlags(args []string) (options, error) {
 		return opt, err
 	}
 	if showVer {
-		fmt.Printf("matrix %s\n", version)
+		fmt.Printf("matrix %s\n", versionString())
 		return opt, errVersion
 	}
 	if fs.NArg() > 0 {
@@ -541,6 +542,40 @@ func parseFlags(args []string) (options, error) {
 	opt.cfg.chars = def.chars
 	opt.cfg.wide = def.wide
 	return opt, nil
+}
+
+// versionString resolves the build version. Release builds inject it with
+// ldflags; go install module@version carries it in the module build info.
+func versionString() string {
+	if version != "dev" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return version
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	rev, dirty := "", false
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if rev == "" {
+		return version
+	}
+	if len(rev) > 7 {
+		rev = rev[:7]
+	}
+	if dirty {
+		rev += "-dirty"
+	}
+	return rev
 }
 
 func parseSize(s string) (int, int, error) {

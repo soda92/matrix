@@ -88,6 +88,12 @@ func TestParseFlagsBasics(t *testing.T) {
 	}
 }
 
+func TestVersionString(t *testing.T) {
+	if got := versionString(); got == "" {
+		t.Fatal("version string is empty")
+	}
+}
+
 func TestParseFlagsCapture(t *testing.T) {
 	opt, err := parseFlags([]string{"--seed", "42", "--frames", "10", "--size", "100x30"})
 	if err != nil {
